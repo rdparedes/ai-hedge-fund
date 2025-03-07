@@ -40,6 +40,16 @@ class Portfolio(BaseModel):
     realized_gains: dict[str, RealizedGains]
 
 
+class PortfolioSnapshot(BaseModel):
+    Date: datetime
+    Value: float
+    Long_Exposure: float = 0.0
+    Short_Exposure: float = 0.0
+    Gross_Exposure: float = 0.0
+    Net_Exposure: float = 0.0
+    Long_Short_Ratio: float = 0.0
+
+
 class Backtester:
     def __init__(
         self,
@@ -77,7 +87,7 @@ class Backtester:
         self.margin_ratio = initial_margin_requirement
 
         # Initialize portfolio with support for long/short positions
-        self.portfolio_values = []
+        self.portfolio_history: list[PortfolioSnapshot] = []
 
         self.portfolio = Portfolio(
             cash=initial_capital,
@@ -140,7 +150,7 @@ class Backtester:
                 # Realized gain/loss using average cost basis
                 avg_cost_per_share = position.long_cost_basis if position.long > 0 else 0
                 realized_gain = (current_price - avg_cost_per_share) * quantity
-                self.portfolio.realized_gains["ticker"]["long"] += realized_gain
+                self.portfolio.realized_gains["ticker"].long += realized_gain
 
                 position.long -= quantity
                 self.portfolio.cash += quantity * current_price
@@ -325,9 +335,9 @@ class Backtester:
 
         # Initialize portfolio values list with initial capital
         if len(dates) > 0:
-            self.portfolio_values = [{"Date": dates[0], "Portfolio Value": self.initial_capital}]
+            self.portfolio_history = [PortfolioSnapshot(Date=dates[0], Value=self.initial_capital)]
         else:
-            self.portfolio_values = []
+            self.portfolio_history = []
 
         for current_date in dates:
             lookback_start = (current_date - timedelta(days=30)).strftime("%Y-%m-%d")
@@ -356,7 +366,7 @@ class Backtester:
                 tickers=self.tickers,
                 start_date=lookback_start,
                 end_date=current_date_str,
-                portfolio=self.portfolio,
+                portfolio=self.portfolio.model_dump(),
                 model_name=self.model_name,
                 model_provider=self.model_provider,
                 selected_analysts=self.selected_analysts,
@@ -380,8 +390,8 @@ class Backtester:
             total_value = self.calculate_portfolio_value(current_prices)
 
             # Also compute long/short exposures for final post‐trade state
-            long_exposure = sum(self.portfolio.positions[t]["long"] * current_prices[t] for t in self.tickers)
-            short_exposure = sum(self.portfolio.positions[t]["short"] * current_prices[t] for t in self.tickers)
+            long_exposure = sum(self.portfolio.positions[t].long * current_prices[t] for t in self.tickers)
+            short_exposure = sum(self.portfolio.positions[t].short * current_prices[t] for t in self.tickers)
 
             # Calculate gross and net exposures
             gross_exposure = long_exposure + short_exposure
@@ -389,16 +399,16 @@ class Backtester:
             long_short_ratio = long_exposure / short_exposure if short_exposure > 1e-9 else float("inf")
 
             # Track each day's portfolio value in self.portfolio_values
-            self.portfolio_values.append(
-                {
-                    "Date": current_date,
-                    "Portfolio Value": total_value,
-                    "Long Exposure": long_exposure,
-                    "Short Exposure": short_exposure,
-                    "Gross Exposure": gross_exposure,
-                    "Net Exposure": net_exposure,
-                    "Long/Short Ratio": long_short_ratio,
-                }
+            self.portfolio_history.append(
+                PortfolioSnapshot(
+                    Date=current_date,
+                    Value=total_value,
+                    Long_Exposure=long_exposure,
+                    Short_Exposure=short_exposure,
+                    Gross_Exposure=gross_exposure,
+                    Net_Exposure=net_exposure,
+                    Long_Short_Ratio=long_short_ratio,
+                )
             )
 
             # ---------------------------------------------------------------
@@ -419,8 +429,8 @@ class Backtester:
 
                 # Calculate net position value
                 pos = self.portfolio.positions[ticker]
-                long_val = pos["long"] * current_prices[ticker]
-                short_val = pos["short"] * current_prices[ticker]
+                long_val = pos.long * current_prices[ticker]
+                short_val = pos.short * current_prices[ticker]
                 net_position_value = long_val - short_val
 
                 # Get the action and quantity from the decisions
@@ -435,7 +445,7 @@ class Backtester:
                         action=action,
                         quantity=quantity,
                         price=current_prices[ticker],
-                        shares_owned=pos["long"] - pos["short"],  # net shares
+                        shares_owned=pos.long - pos.short,  # net shares
                         position_value=net_position_value,
                         bullish_count=bullish_count,
                         bearish_count=bearish_count,
@@ -446,8 +456,7 @@ class Backtester:
             # 4) Calculate performance summary metrics
             # ---------------------------------------------------------------
             total_realized_gains = sum(
-                self.portfolio.realized_gains[t]["long"] + self.portfolio.realized_gains[t]["short"]
-                for t in self.tickers
+                self.portfolio.realized_gains[t].long + self.portfolio.realized_gains[t].short for t in self.tickers
             )
 
             # Calculate cumulative return vs. initial capital
@@ -481,15 +490,15 @@ class Backtester:
             print_backtest_results(table_rows)
 
             # Update performance metrics if we have enough data
-            if len(self.portfolio_values) > 3:
+            if len(self.portfolio_history) > 3:
                 self._update_performance_metrics(performance_metrics)
 
         return performance_metrics
 
     def _update_performance_metrics(self, performance_metrics):
         """Helper method to update performance metrics using daily returns."""
-        values_df = pd.DataFrame(self.portfolio_values).set_index("Date")
-        values_df["Daily Return"] = values_df["Portfolio Value"].pct_change()
+        values_df = pd.DataFrame([pv.model_dump() for pv in self.portfolio_history]).set_index("Date")
+        values_df["Daily Return"] = values_df["Portfolio_Value"].pct_change()
         clean_returns = values_df["Daily Return"].dropna()
 
         if len(clean_returns) < 2:
@@ -519,23 +528,23 @@ class Backtester:
             performance_metrics["sortino_ratio"] = float("inf") if mean_excess_return > 0 else 0
 
         # Maximum drawdown
-        rolling_max = values_df["Portfolio Value"].cummax()
-        drawdown = (values_df["Portfolio Value"] - rolling_max) / rolling_max
+        rolling_max = values_df["Portfolio_Value"].cummax()
+        drawdown = (values_df["Portfolio_Value"] - rolling_max) / rolling_max
         performance_metrics["max_drawdown"] = drawdown.min() * 100
 
     def analyze_performance(self):
         """Creates a performance DataFrame, prints summary stats, and plots equity curve."""
-        if not self.portfolio_values:
+        if not self.portfolio_history:
             print("No portfolio data found. Please run the backtest first.")
             return pd.DataFrame()
 
-        performance_df = pd.DataFrame(self.portfolio_values).set_index("Date")
+        performance_df = pd.DataFrame([pv.model_dump() for pv in self.portfolio_history]).set_index("Date")
         if performance_df.empty:
             print("No valid performance data to analyze.")
             return performance_df
 
-        final_portfolio_value = performance_df["Portfolio Value"].iloc[-1]
-        total_realized_gains = sum(self.portfolio.realized_gains[ticker]["long"] for ticker in self.tickers)
+        final_portfolio_value = performance_df["Portfolio_Value"].iloc[-1]
+        total_realized_gains = sum(self.portfolio.realized_gains[ticker].long for ticker in self.tickers)
         total_return = ((final_portfolio_value - self.initial_capital) / self.initial_capital) * 100
 
         print(f"\n{Fore.WHITE}{Style.BRIGHT}PORTFOLIO PERFORMANCE SUMMARY:{Style.RESET_ALL}")
@@ -546,7 +555,7 @@ class Backtester:
 
         # Plot the portfolio value over time
         plt.figure(figsize=(12, 6))
-        plt.plot(performance_df.index, performance_df["Portfolio Value"], color="blue")
+        plt.plot(performance_df.index, performance_df["Portfolio_Value"], color="blue")
         plt.title("Portfolio Value Over Time")
         plt.ylabel("Portfolio Value ($)")
         plt.xlabel("Date")
@@ -554,7 +563,7 @@ class Backtester:
         plt.show()
 
         # Compute daily returns
-        performance_df["Daily Return"] = performance_df["Portfolio Value"].pct_change().fillna(0)
+        performance_df["Daily Return"] = performance_df["Portfolio_Value"].pct_change().fillna(0)
         daily_rf = 0.0434 / 252  # daily risk-free rate
         mean_daily_return = performance_df["Daily Return"].mean()
         std_daily_return = performance_df["Daily Return"].std()
@@ -567,8 +576,8 @@ class Backtester:
         print(f"\nSharpe Ratio: {Fore.YELLOW}{annualized_sharpe:.2f}{Style.RESET_ALL}")
 
         # Max Drawdown
-        rolling_max = performance_df["Portfolio Value"].cummax()
-        drawdown = (performance_df["Portfolio Value"] - rolling_max) / rolling_max
+        rolling_max = performance_df["Portfolio_Value"].cummax()
+        drawdown = (performance_df["Portfolio_Value"] - rolling_max) / rolling_max
         max_drawdown = drawdown.min()
         max_drawdown_date = drawdown.idxmin()
         if pd.notnull(max_drawdown_date):
